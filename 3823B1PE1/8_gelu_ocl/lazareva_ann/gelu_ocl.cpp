@@ -1,161 +1,185 @@
 #include "gelu_ocl.h"
 
-#define CL_TARGET_OPENCL_VERSION 120
-#define CL_USE_DEPRECATED_OPENCL_1_2_APIS
-
-#ifdef __APPLE__
-#include <OpenCL/cl.h>
-#else
+#define CL_TARGET_OPENCL_VERSION 300
 #include <CL/cl.h>
-#endif
 
-#include <cstddef>
-#include <cstring>
-#include <thread>
+#include <cstdio>
+#include <map>
+#include <stdexcept>
+#include <string>
 #include <vector>
+
+#define OCL_CHECK(call)                                                      \
+    do {                                                                     \
+        if (cl_int ocl_status = (call); ocl_status != CL_SUCCESS) {          \
+            std::fprintf(stderr, "OpenCL error at %s:%d: code %d\n",         \
+                         __FILE__, __LINE__, ocl_status);                    \
+            throw std::runtime_error("OpenCL error");                        \
+        }                                                                    \
+    } while (0)
 
 namespace {
 
-const char* kKernelSource = R"CLC(
-__kernel void gelu_kernel(__global float* data, const uint n) {
-    const float k1 = -1.5957691216057308f;
-    const float k2 = -0.0713548162726009f;
-
-    uint gid = get_global_id(0);
-    uint n4 = n >> 2;
-
-    if (gid < n4) {
-        float4 v = vload4(gid, data);
-        float4 z = v * (k1 + k2 * v * v);
-        float4 e = native_exp(z);
-        float4 r = v / (1.0f + e);
-        vstore4(r, gid, data);
+const char* kGeluKernelSource = R"CLC(
+__kernel void gelu_vec4(__global const float* input,
+                        __global float* output,
+                        const unsigned int element_count)
+{
+    unsigned int base = get_global_id(0) * 4u;
+    if (base + 3u < element_count) {
+        float4 x = vload4(0, input + base);
+        float4 x3 = x * x * x;
+        float4 arg = -1.5957691216057308f * (x + 0.044715f * x3);
+        vstore4(x / ((float4)(1.0f) + exp(arg)), 0, output + base);
     } else {
-        uint tail_idx = gid - n4;
-        uint rem = n & 3u;
-        if (tail_idx < rem) {
-            uint idx = n4 * 4u + tail_idx;
-            float x = data[idx];
-            float z = x * (k1 + k2 * x * x);
-            float e = native_exp(z);
-            data[idx] = x / (1.0f + e);
+        for (unsigned int i = base; i < element_count; ++i) {
+            float x = input[i];
+            float arg = -1.5957691216057308f * (x + 0.044715f * x * x * x);
+            output[i] = x / (1.0f + exp(arg));
         }
     }
 }
 )CLC";
 
-constexpr size_t kLocalSize = 256;
+constexpr std::size_t kLocalWorkSize = 256;
+constexpr std::size_t kVectorWidth = 4;
+constexpr const char* kKernelName = "gelu_vec4";
 
-struct OclContext {
-    cl_platform_id platform_id = nullptr;
-    cl_device_id device_id = nullptr;
+struct OpenClContext {
+    cl_command_queue command_queue = nullptr;
     cl_context context = nullptr;
-    cl_command_queue queue = nullptr;
-    cl_program program = nullptr;
     cl_kernel kernel = nullptr;
-
-    cl_mem d_data = nullptr;
-    size_t capacity = 0;
-
-    int cached_platform_index = -1;
-    bool ready = false;
+    cl_mem input_buffer = nullptr;
+    cl_mem output_buffer = nullptr;
+    std::size_t buffer_element_capacity = 0;
 };
 
-OclContext& Ctx() {
-    static OclContext ctx;
+OpenClContext create_opencl_context(int platform) {
+    cl_uint platform_count = 0;
+    OCL_CHECK(clGetPlatformIDs(0, nullptr, &platform_count));
+    if (platform < 0 || static_cast<cl_uint>(platform) >= platform_count)
+        throw std::runtime_error("Invalid OpenCL platform index");
+
+    std::vector<cl_platform_id> platforms(platform_count);
+    OCL_CHECK(clGetPlatformIDs(platform_count, platforms.data(), nullptr));
+
+    cl_device_id device = nullptr;
+    OCL_CHECK(clGetDeviceIDs(platforms[platform], CL_DEVICE_TYPE_GPU,
+                             1, &device, nullptr));
+
+    OpenClContext ctx;
+    cl_int status = CL_SUCCESS;
+
+    ctx.context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &status);
+    OCL_CHECK(status);
+
+#if defined(CL_VERSION_2_0)
+    const cl_queue_properties properties[] = {0};
+    ctx.command_queue = clCreateCommandQueueWithProperties(
+        ctx.context, device, properties, &status);
+#else
+    ctx.command_queue =
+        clCreateCommandQueue(ctx.context, device, 0, &status);
+#endif
+    OCL_CHECK(status);
+
+    cl_program program = clCreateProgramWithSource(
+        ctx.context, 1, &kGeluKernelSource, nullptr, &status);
+    OCL_CHECK(status);
+
+    if (clBuildProgram(program, 1, &device, "", nullptr, nullptr) != CL_SUCCESS) {
+        std::size_t log_size = 0;
+        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG,
+                              0, nullptr, &log_size);
+        std::string log(log_size, '\0');
+        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG,
+                              log_size, log.data(), nullptr);
+        std::fprintf(stderr, "OpenCL build failed:\n%s\n", log.c_str());
+        throw std::runtime_error("OpenCL build error");
+    }
+
+    ctx.kernel = clCreateKernel(program, kKernelName, &status);
+    OCL_CHECK(status);
+    clReleaseProgram(program);
+
     return ctx;
 }
 
-void InitOpenCL(OclContext& ctx, int platform_index) {
-    cl_uint num_platforms = 0;
-    clGetPlatformIDs(0, nullptr, &num_platforms);
-    if (num_platforms == 0) {
-        return;
-    }
+OpenClContext& get_or_create_context(int platform) {
+    static std::map<int, OpenClContext> cached_contexts;
 
-    std::vector<cl_platform_id> platforms(num_platforms);
-    clGetPlatformIDs(num_platforms, platforms.data(), nullptr);
+    const auto cached = cached_contexts.find(platform);
+    if (cached != cached_contexts.end())
+        return cached->second;
 
-    if (platform_index < 0 || static_cast<cl_uint>(platform_index) >= num_platforms) {
-        platform_index = 0;
-    }
-    ctx.platform_id = platforms[platform_index];
-
-    cl_int err = clGetDeviceIDs(ctx.platform_id, CL_DEVICE_TYPE_GPU, 1, &ctx.device_id, nullptr);
-    if (err != CL_SUCCESS) {
-        return;
-    }
-
-    ctx.context = clCreateContext(nullptr, 1, &ctx.device_id, nullptr, nullptr, &err);
-
-#ifdef CL_VERSION_2_0
-    ctx.queue = clCreateCommandQueueWithProperties(ctx.context, ctx.device_id, nullptr, &err);
-#else
-    ctx.queue = clCreateCommandQueue(ctx.context, ctx.device_id, 0, &err);
-#endif
-
-    const char* src = kKernelSource;
-    const size_t src_len = std::strlen(kKernelSource);
-    ctx.program = clCreateProgramWithSource(ctx.context, 1, &src, &src_len, &err);
-    clBuildProgram(ctx.program, 1, &ctx.device_id, "-cl-fast-relaxed-math", nullptr, nullptr);
-
-    ctx.kernel = clCreateKernel(ctx.program, "gelu_kernel", &err);
-
-    ctx.cached_platform_index = platform_index;
-    ctx.ready = true;
+    return cached_contexts.emplace(platform, create_opencl_context(platform))
+        .first->second;
 }
 
-void EnsureCapacity(OclContext& ctx, size_t n) {
-    if (n > ctx.capacity) {
-        if (ctx.d_data != nullptr) {
-            clReleaseMemObject(ctx.d_data);
-        }
-        cl_int err = CL_SUCCESS;
-        ctx.d_data = clCreateBuffer(ctx.context, CL_MEM_READ_WRITE, n * sizeof(float), nullptr, &err);
-        ctx.capacity = n;
-    }
+void ensure_buffer_capacity(OpenClContext& ctx, std::size_t element_count) {
+    if (ctx.buffer_element_capacity >= element_count)
+        return;
+
+    if (ctx.input_buffer)
+        clReleaseMemObject(ctx.input_buffer);
+
+    if (ctx.output_buffer)
+        clReleaseMemObject(ctx.output_buffer);
+
+    const std::size_t buffer_size_bytes = element_count * sizeof(float);
+    cl_int status = CL_SUCCESS;
+
+    ctx.input_buffer = clCreateBuffer(
+        ctx.context, CL_MEM_READ_ONLY, buffer_size_bytes, nullptr, &status);
+    OCL_CHECK(status);
+
+    ctx.output_buffer = clCreateBuffer(
+        ctx.context, CL_MEM_WRITE_ONLY, buffer_size_bytes, nullptr, &status);
+    OCL_CHECK(status);
+
+    ctx.buffer_element_capacity = element_count;
 }
 
-}  // namespace
+void enqueue_gelu_kernel(OpenClContext& ctx,
+                         const std::vector<float>& input,
+                         std::size_t element_count) {
+    OCL_CHECK(clEnqueueWriteBuffer(ctx.command_queue, ctx.input_buffer,
+                                   CL_FALSE, 0, element_count * sizeof(float),
+                                   input.data(), 0, nullptr, nullptr));
+
+    OCL_CHECK(clSetKernelArg(ctx.kernel, 0, sizeof(cl_mem), &ctx.input_buffer));
+    OCL_CHECK(clSetKernelArg(ctx.kernel, 1, sizeof(cl_mem), &ctx.output_buffer));
+    const unsigned int element_count_arg =
+        static_cast<unsigned int>(element_count);
+    OCL_CHECK(clSetKernelArg(ctx.kernel, 2, sizeof(unsigned int),
+                             &element_count_arg));
+
+    const std::size_t vector_group_count =
+        (element_count + kVectorWidth - 1) / kVectorWidth;
+    const std::size_t global_work_size =
+        ((vector_group_count + kLocalWorkSize - 1) / kLocalWorkSize) *
+        kLocalWorkSize;
+
+    OCL_CHECK(clEnqueueNDRangeKernel(ctx.command_queue, ctx.kernel,
+                                     1, nullptr, &global_work_size,
+                                     &kLocalWorkSize, 0, nullptr, nullptr));
+}
+
+} // namespace
 
 std::vector<float> GeluOCL(const std::vector<float>& input, int platform) {
-    const size_t n = input.size();
-    if (n == 0) {
+    const std::size_t element_count = input.size();
+    if (element_count == 0)
         return {};
-    }
 
-    OclContext& ctx = Ctx();
-    if (!ctx.ready || ctx.cached_platform_index != platform) {
-        InitOpenCL(ctx, platform);
-    }
-    if (!ctx.ready) {
-        return {};
-    }
+    OpenClContext& ctx = get_or_create_context(platform);
+    ensure_buffer_capacity(ctx, element_count);
+    enqueue_gelu_kernel(ctx, input, element_count);
 
-    EnsureCapacity(ctx, n);
-
-    const size_t bytes = n * sizeof(float);
-
-    std::vector<float> output;
-    std::thread allocator([&output, n] { output.resize(n); });
-
-    clEnqueueWriteBuffer(ctx.queue, ctx.d_data, CL_FALSE, 0, bytes, input.data(), 0, nullptr, nullptr);
-
-    const size_t n4 = n / 4;
-    const size_t rem = n % 4;
-    const size_t total_threads = n4 + rem;
-    const size_t global_size = ((total_threads + kLocalSize - 1) / kLocalSize) * kLocalSize;
-
-    cl_uint n_arg = static_cast<cl_uint>(n);
-    clSetKernelArg(ctx.kernel, 0, sizeof(cl_mem), &ctx.d_data);
-    clSetKernelArg(ctx.kernel, 1, sizeof(cl_uint), &n_arg);
-
-    clEnqueueNDRangeKernel(ctx.queue, ctx.kernel, 1, nullptr, &global_size, &kLocalSize, 0, nullptr,
-                           nullptr);
-
-    allocator.join();
-
-    clEnqueueReadBuffer(ctx.queue, ctx.d_data, CL_TRUE, 0, bytes, output.data(), 0, nullptr, nullptr);
+    std::vector<float> output(element_count);
+    OCL_CHECK(clEnqueueReadBuffer(ctx.command_queue, ctx.output_buffer,
+                                  CL_TRUE, 0, element_count * sizeof(float),
+                                  output.data(), 0, nullptr, nullptr));
 
     return output;
 }
