@@ -752,6 +752,7 @@ std::vector<float> GeluOCL(const std::vector<float>& input, int platform) {
 |3823B1PE2|sinev_artem|0.1980|4|
 |3823B1PE1|lazareva_ann|0.2180|9|
 |3823B1PE1|kondrashova_victoria|0.2490|6|
+|3823B1PE4|terekhov_dmitriy|0.3640|4|
 
 ## 8_gelu_ocl (134217728 elements)
 |Group|Name|Result|Rank|
@@ -877,7 +878,7 @@ Passed: 4
 |3823B1PE4|remizov_kirill|6/8|360|
 |3823B1PE4|romanov_michail|6/8|329|
 |3823B1PE4|safronov_maksim|4/8|200|
-|3823B1PE4|terekhov_dmitriy|6/8|313|
+|3823B1PE4|terekhov_dmitriy|7/8|371|
 |3823B1PE4|tsarkov_klim|**8/8**|**442**|
 |3823B1PE4|urin_oleg|4/8|215|
 |3823B1PE4|zaharov_gleb|6/8|347|
