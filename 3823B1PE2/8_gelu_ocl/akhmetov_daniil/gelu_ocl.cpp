@@ -1,101 +1,179 @@
-#ifndef CL_TARGET_OPENCL_VERSION
-#define CL_TARGET_OPENCL_VERSION 120
-#endif
-
 #include "gelu_ocl.h"
-#include <CL/cl.h>
-#include <vector>
-#include <cstddef>
 
-static const char* kGeluKernelSource = R"(
-__kernel void gelu_kernel(__global const float* restrict input,
-                          __global float* restrict output,
-                          const unsigned long n) {
-    size_t idx = get_global_id(0);
-    if (idx < n) {
-        float x = input[idx];
-        float x2 = x * x;
-        float exponent = x * fma(x2, -0.07135481f, -1.59576912f);
-        output[idx] = x / (1.0f + native_exp(exponent));
+#define CL_TARGET_OPENCL_VERSION 120
+#define CL_USE_DEPRECATED_OPENCL_1_2_APIS
+#include <CL/cl.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
+#include <thread>
+#include <vector>
+
+namespace {
+
+constexpr size_t kChunk = size_t(1) << 22;
+constexpr size_t kGroup = 256;
+
+const char kSource[] = R"CLC(
+__kernel void gelu(__global float* data, ulong begin, ulong end) {
+    const ulong i = begin + get_global_id(0) * 4;
+    if (i + 3 < end) {
+        const float4 x = vload4(0, data + i);
+        vstore4(x / (1.0f + exp(-x * (1.5957691216057308f + 0.0713548162726009f * x * x))), 0, data + i);
+    } else {
+        for (ulong j = i; j < end; ++j) {
+            const float x = data[j];
+            data[j] = x / (1.0f + exp(-x * (1.5957691216057308f + 0.0713548162726009f * x * x)));
+        }
     }
 }
-)";
+)CLC";
+
+struct Context {
+    int platform = -1;
+    cl_context context = nullptr;
+    cl_command_queue upload = nullptr;
+    cl_command_queue download = nullptr;
+    cl_program program = nullptr;
+    cl_kernel kernel = nullptr;
+    cl_mem device = nullptr;
+    cl_mem host_out = nullptr;
+    float* pinned_out = nullptr;
+    size_t capacity = 0;
+
+    explicit Context(int index) : platform(index) {
+        cl_uint count = 0;
+        clGetPlatformIDs(0, nullptr, &count);
+        std::vector<cl_platform_id> platforms(count);
+        clGetPlatformIDs(count, platforms.data(), nullptr);
+        cl_device_id device_id = nullptr;
+        clGetDeviceIDs(platforms[index], CL_DEVICE_TYPE_GPU, 1, &device_id, nullptr);
+        context = clCreateContext(nullptr, 1, &device_id, nullptr, nullptr, nullptr);
+        upload = clCreateCommandQueue(context, device_id, 0, nullptr);
+        download = clCreateCommandQueue(context, device_id, 0, nullptr);
+        const char* source = kSource;
+        program = clCreateProgramWithSource(context, 1, &source, nullptr, nullptr);
+        clBuildProgram(program, 1, &device_id, nullptr, nullptr, nullptr);
+        kernel = clCreateKernel(program, "gelu", nullptr);
+    }
+
+    ~Context() {
+        Release();
+        clReleaseKernel(kernel);
+        clReleaseProgram(program);
+        clReleaseCommandQueue(upload);
+        clReleaseCommandQueue(download);
+        clReleaseContext(context);
+    }
+
+    void Release() {
+        if (pinned_out != nullptr) {
+            clEnqueueUnmapMemObject(upload, host_out, pinned_out, 0, nullptr, nullptr);
+            clFinish(upload);
+        }
+        if (host_out != nullptr) {
+            clReleaseMemObject(host_out);
+        }
+        if (device != nullptr) {
+            clReleaseMemObject(device);
+        }
+        host_out = device = nullptr;
+        pinned_out = nullptr;
+        capacity = 0;
+    }
+
+    void Reserve(size_t n) {
+        if (n <= capacity) {
+            return;
+        }
+        Release();
+        const size_t bytes = n * sizeof(float);
+        device = clCreateBuffer(context, CL_MEM_READ_WRITE, bytes, nullptr, nullptr);
+        host_out = clCreateBuffer(context, CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR, bytes, nullptr, nullptr);
+        pinned_out = static_cast<float*>(
+            clEnqueueMapBuffer(upload, host_out, CL_TRUE, CL_MAP_READ, 0, bytes, 0, nullptr, nullptr, nullptr));
+        capacity = n;
+    }
+};
+
+Context& GetContext(int platform) {
+    static Context* context = nullptr;
+    if (context == nullptr || context->platform != platform) {
+        delete context;
+        context = new Context(platform);
+    }
+    return *context;
+}
+
+}  // namespace
 
 std::vector<float> GeluOCL(const std::vector<float>& input, int platform) {
-    size_t size = input.size();
-    if (size == 0) {
-        return {};
+    const size_t n = input.size();
+    std::vector<float> output;
+    if (n == 0) {
+        return output;
     }
-    size_t bytes = size * sizeof(float);
 
-    static bool initialized = false;
-    static int cached_platform = -1;
-    static cl_context context = nullptr;
-    static cl_command_queue queue = nullptr;
-    static cl_program program = nullptr;
-    static cl_kernel kernel = nullptr;
-    static cl_mem d_in = nullptr;
-    static cl_mem d_out = nullptr;
-    static size_t cached_bytes = 0;
+    Context& ctx = GetContext(platform);
+    ctx.Reserve(n);
+    const size_t global = ((n + 3) / 4 + kGroup - 1) / kGroup * kGroup;
+    const cl_ulong count = n;
+    const cl_ulong zero = 0;
 
-    if (!initialized || cached_platform != platform) {
-        if (initialized) {
-            if (d_in) clReleaseMemObject(d_in);
-            if (d_out) clReleaseMemObject(d_out);
-            if (kernel) clReleaseKernel(kernel);
-            if (program) clReleaseProgram(program);
-            if (queue) clReleaseCommandQueue(queue);
-            if (context) clReleaseContext(context);
-            d_in = nullptr;
-            d_out = nullptr;
-            cached_bytes = 0;
+    if (ctx.pinned_out == nullptr) {
+        output.resize(n);
+        clEnqueueWriteBuffer(ctx.upload, ctx.device, CL_FALSE, 0, n * sizeof(float), input.data(), 0, nullptr,
+                             nullptr);
+        clSetKernelArg(ctx.kernel, 0, sizeof(cl_mem), &ctx.device);
+        clSetKernelArg(ctx.kernel, 1, sizeof(zero), &zero);
+        clSetKernelArg(ctx.kernel, 2, sizeof(count), &count);
+        clEnqueueNDRangeKernel(ctx.upload, ctx.kernel, 1, nullptr, &global, &kGroup, 0, nullptr, nullptr);
+        clEnqueueReadBuffer(ctx.upload, ctx.device, CL_TRUE, 0, n * sizeof(float), output.data(), 0, nullptr,
+                            nullptr);
+        return output;
+    }
+
+    const size_t chunks = (n + kChunk - 1) / kChunk;
+    std::vector<cl_event> computed(chunks);
+    std::vector<cl_event> downloaded(chunks);
+    std::atomic<size_t> issued{0};
+
+    output.reserve(n);
+    std::thread builder([&] {
+        for (size_t c = 0; c < chunks; ++c) {
+            while (issued.load(std::memory_order_acquire) <= c) {
+                std::this_thread::yield();
+            }
+            clWaitForEvents(1, &downloaded[c]);
+            const size_t begin = c * kChunk;
+            output.insert(output.end(), ctx.pinned_out + begin, ctx.pinned_out + std::min(n, begin + kChunk));
         }
+    });
 
-        cl_uint num_platforms = 0;
-        clGetPlatformIDs(0, nullptr, &num_platforms);
-        std::vector<cl_platform_id> platforms(num_platforms);
-        clGetPlatformIDs(num_platforms, platforms.data(), nullptr);
+    for (size_t c = 0; c < chunks; ++c) {
+        const cl_ulong begin = c * kChunk;
+        const cl_ulong end = std::min(n, c * kChunk + kChunk);
+        const size_t bytes = (end - begin) * sizeof(float);
+        const size_t items = ((end - begin + 3) / 4 + kGroup - 1) / kGroup * kGroup;
 
-        cl_platform_id plat = platforms[platform];
-
-        cl_device_id device = nullptr;
-        clGetDeviceIDs(plat, CL_DEVICE_GPU, 1, &device, nullptr);
-
-        context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, nullptr);
-        queue = clCreateCommandQueue(context, device, 0, nullptr);
-
-        program = clCreateProgramWithSource(context, 1, &kGeluKernelSource, nullptr, nullptr);
-        clBuildProgram(program, 1, &device, "-cl-fast-relaxed-math -cl-mad-enable", nullptr, nullptr);
-        kernel = clCreateKernel(program, "gelu_kernel", nullptr);
-
-        cached_platform = platform;
-        initialized = true;
+        clEnqueueWriteBuffer(ctx.upload, ctx.device, CL_FALSE, begin * sizeof(float), bytes, input.data() + begin, 0,
+                             nullptr, nullptr);
+        clSetKernelArg(ctx.kernel, 0, sizeof(cl_mem), &ctx.device);
+        clSetKernelArg(ctx.kernel, 1, sizeof(begin), &begin);
+        clSetKernelArg(ctx.kernel, 2, sizeof(end), &end);
+        clEnqueueNDRangeKernel(ctx.upload, ctx.kernel, 1, nullptr, &items, &kGroup, 0, nullptr, &computed[c]);
+        clFlush(ctx.upload);
+        clEnqueueReadBuffer(ctx.download, ctx.device, CL_FALSE, begin * sizeof(float), bytes, ctx.pinned_out + begin, 1,
+                            &computed[c], &downloaded[c]);
+        clFlush(ctx.download);
+        issued.store(c + 1, std::memory_order_release);
     }
 
-    if (cached_bytes < bytes) {
-        if (d_in) clReleaseMemObject(d_in);
-        if (d_out) clReleaseMemObject(d_out);
-        d_in = clCreateBuffer(context, CL_MEM_READ_ONLY, bytes, nullptr, nullptr);
-        d_out = clCreateBuffer(context, CL_MEM_WRITE_ONLY, bytes, nullptr, nullptr);
-        cached_bytes = bytes;
+    builder.join();
+    for (size_t c = 0; c < chunks; ++c) {
+        clReleaseEvent(computed[c]);
+        clReleaseEvent(downloaded[c]);
     }
-
-    clEnqueueWriteBuffer(queue, d_in, CL_FALSE, 0, bytes, input.data(), 0, nullptr, nullptr);
-
-    cl_ulong n_arg = static_cast<cl_ulong>(size);
-    clSetKernelArg(kernel, 0, sizeof(cl_mem), &d_in);
-    clSetKernelArg(kernel, 1, sizeof(cl_mem), &d_out);
-    clSetKernelArg(kernel, 2, sizeof(cl_ulong), &n_arg);
-
-    const size_t local_size = 256;
-    const size_t global_size = ((size + local_size - 1) / local_size) * local_size;
-    clEnqueueNDRangeKernel(queue, kernel, 1, nullptr, &global_size, &local_size, 0, nullptr, nullptr);
-
-    clFlush(queue);
-
-    std::vector<float> output(size);
-
-    clEnqueueReadBuffer(queue, d_out, CL_TRUE, 0, bytes, output.data(), 0, nullptr, nullptr);
-
     return output;
 }
