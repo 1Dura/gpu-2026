@@ -66,34 +66,35 @@ namespace
 
     DeviceBuffers g_buf;
 
-    std::vector<float> GeluCUDA(const std::vector<float> &input)
+} // namespace
+
+std::vector<float> GeluCUDA(const std::vector<float> &input)
+{
+    const std::size_t size = input.size();
+    std::vector<float> output(size);
+    if (size == 0)
+        return output;
+
+    const std::size_t bytes = size * sizeof(float);
+    if (!g_buf.ensure(bytes))
     {
-        const std::size_t size = input.size();
-        std::vector<float> output(size);
-        if (size == 0)
-            return output;
-
-        const std::size_t bytes = size * sizeof(float);
-        if (!g_buf.ensure(bytes))
-        {
-            std::fprintf(stderr, "CUDA: failed to allocate %zu bytes\n", bytes);
-            return output;
-        }
-
-        cudaMemcpy(g_buf.d_in, input.data(), bytes, cudaMemcpyHostToDevice);
-
-        constexpr int kBlock = 256;
-        const int n = static_cast<int>(size);
-        const int grid = (n + kBlock - 1) / kBlock;
-        GeluKernel<<<grid, kBlock>>>(g_buf.d_in, g_buf.d_out, n);
-
-        cudaMemcpy(output.data(), g_buf.d_out, bytes, cudaMemcpyDeviceToHost);
-
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess)
-        {
-            std::fprintf(stderr, "CUDA error: %s\n", cudaGetErrorString(err));
-        }
+        std::fprintf(stderr, "CUDA: failed to allocate %zu bytes\n", bytes);
         return output;
     }
+
+    cudaMemcpy(g_buf.d_in, input.data(), bytes, cudaMemcpyHostToDevice);
+
+    constexpr int kBlock = 256;
+    const int n = static_cast<int>(size);
+    const int grid = (n + kBlock - 1) / kBlock;
+    GeluKernel<<<grid, kBlock>>>(g_buf.d_in, g_buf.d_out, n);
+
+    cudaMemcpy(output.data(), g_buf.d_out, bytes, cudaMemcpyDeviceToHost);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+    {
+        std::fprintf(stderr, "CUDA error: %s\n", cudaGetErrorString(err));
+    }
+    return output;
 }
