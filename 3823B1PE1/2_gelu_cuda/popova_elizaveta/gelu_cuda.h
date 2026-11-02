@@ -3,6 +3,6 @@
 
 #include <vector>
 
-std::vector<float> GeluCUDA(const std::vector<float>& input);
+std::vector<float> GeluCUDA(const std::vector<float> &input);
 
 #endif // __GELU_CUDA_H
