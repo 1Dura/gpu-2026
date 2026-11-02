@@ -786,6 +786,7 @@ std::vector<float> GeluOCL(const std::vector<float>& input, int platform) {
 |3823B1PE2|zyuzin_nikita|0.2012|6|
 |**FAST**|**FAST**|**0.2036**|**-**|
 |3823B1FI1|zenin_anton|0.2050|1|
+|3823B1PE4|karpich_ivan|0.2102|5|
 |3823B1PE4|peryashkin_vasily|0.2377|3|
 |3823B1PE3|dergachev_arseniy|0.2382|1|
 |3823B1FI3|lifanov_kirill|0.2386|1|
@@ -899,21 +900,21 @@ Passed: 4
 |Group|Name|Passed|Score|
 |-----|----|------|-----|
 |3823B1PE4|baranov_andrey|3/8|158|
-|3823B1PE4|dilshodov_adkham|**8/8**|**498**|
-|3823B1PE4|karpich_ivan|7/8|382|
-|3823B1PE4|peryashkin_vasily|**8/8**|**468**|
+|3823B1PE4|dilshodov_adkham|**8/8**|**497**|
+|3823B1PE4|karpich_ivan|**8/8**|**442**|
+|3823B1PE4|peryashkin_vasily|**8/8**|**467**|
 |3823B1PE4|remizov_kirill|6/8|355|
 |3823B1PE4|romanov_michail|6/8|321|
 |3823B1PE4|safronov_maksim|4/8|194|
-|3823B1PE4|terekhov_dmitriy|**8/8**|**422**|
+|3823B1PE4|terekhov_dmitriy|**8/8**|**421**|
 |3823B1PE4|trofimov_nikita|4/8|191|
-|3823B1PE4|tsarkov_klim|**8/8**|**432**|
+|3823B1PE4|tsarkov_klim|**8/8**|**431**|
 |3823B1PE4|urin_oleg|4/8|210|
 |3823B1PE4|zaharov_gleb|6/8|339|
 
-Passed: 4
+Passed: 5
 
-**Total Passed: 26**
+**Total Passed: 27**
 
 ---
 *Maximum Score: 512 (64 per task)*
