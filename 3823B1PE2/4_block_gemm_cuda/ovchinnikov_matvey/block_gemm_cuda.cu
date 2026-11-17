@@ -1,12 +1,6 @@
 #include "block_gemm_cuda.h"
 #include <future>
-#define BlockRows 128
-#define BlockCols 128
-#define StepK 8
-#define ThreadRows 8
-#define ThreadCols 8
 
-#define ThreadSize 16
 __global__ void KernelS(float *c, const float *a, const float *b, int n) {
   __shared__ float As[ThreadSize][ThreadSize];
   __shared__ float Bs[ThreadSize][ThreadSize];
@@ -102,7 +96,7 @@ std::vector<float> BlockGemmCUDA(const std::vector<float> &a,
     cudaMalloc(&d_res, bs);
     allocated = bs;
   }
-#define Lines 8 // число полос
+
   static cudaStream_t streams[Lines];
   static bool streams_ready = false;
   if (!streams_ready) {
