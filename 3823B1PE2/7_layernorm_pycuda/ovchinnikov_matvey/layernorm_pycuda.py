@@ -2,13 +2,11 @@ import ctypes
 import threading
 
 import numpy as np
-import pycuda.autoinit  # noqa: F401  (создаёт CUDA-контекст)
+import pycuda.autoinit 
 import pycuda.driver as cuda
 from pycuda.compiler import SourceModule
 
-# ---------------------------------------------------------------------------
-# CUDA-ядра. Один блок = одна строка матрицы.
-# ---------------------------------------------------------------------------
+
 _SRC = r"""
 __device__ __forceinline__ float WarpSum(float v) {
     for (int off = 16; off > 0; off >>= 1)
@@ -16,7 +14,6 @@ __device__ __forceinline__ float WarpSum(float v) {
     return v;
 }
 
-// Сумма по всему блоку: сначала внутри warp'ов, потом между warp'ами через shared.
 __device__ float BlockSum(float v) {
     __shared__ float buf[32];
     int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -35,8 +32,6 @@ __device__ float BlockSum(float v) {
     return r;
 }
 
-// Быстрое ядро: каждый поток держит VEC штук float4 своей строки в регистрах.
-// cols == blockDim.x * 4 * VEC. Строка читается из памяти ровно один раз.
 template <int VEC>
 __device__ void LayerNormReg(const float* __restrict__ in, float* __restrict__ out,
                              const float* __restrict__ gamma,
@@ -55,8 +50,6 @@ __device__ void LayerNormReg(const float* __restrict__ in, float* __restrict__ o
     }
     float mean = BlockSum(s) / cols;
 
-    // Дисперсия вторым проходом по регистрам: sum((x - mean)^2).
-    // Это точнее, чем E[x^2] - mean^2 (нет вычитания близких больших чисел).
     float q = 0.0f;
     #pragma unroll
     for (int k = 0; k < VEC; ++k) {
@@ -82,7 +75,6 @@ __global__ void ln_reg4(const float* in, float* out, const float* g, const float
 __global__ void ln_reg8(const float* in, float* out, const float* g, const float* b,
                         int cols, float eps) { LayerNormReg<8>(in, out, g, b, cols, eps); }
 
-// Универсальное ядро для любых размеров: поток идёт по строке с шагом blockDim.x.
 __global__ void ln_simple(const float* __restrict__ in, float* __restrict__ out,
                           const float* __restrict__ g, const float* __restrict__ b,
                           int cols, float eps) {
@@ -105,7 +97,7 @@ _ln_reg4 = _mod.get_function("ln_reg4")
 _ln_reg8 = _mod.get_function("ln_reg8")
 _ln_simple = _mod.get_function("ln_simple")
 for _f in (_ln_reg4, _ln_reg8, _ln_simple):
-    _f.prepare("PPPPif")  # 4 указателя, int, float — быстрый вызов без разбора типов
+    _f.prepare("PPPPif")
 
 
 def _pick_kernel(cols):
@@ -117,17 +109,10 @@ def _pick_kernel(cols):
     return _ln_simple, max(32, min(256, cols))
 
 
-# ---------------------------------------------------------------------------
-# Быстрое выделение выходного массива (как в 6-й лабе).
-# np.empty на 512 МБ берёт у glibc "свежую" память через mmap, и копия с GPU в
-# неё упирается в page fault'ы: ~113 мс вместо ~57 мс в уже прогретую память.
-# Просим glibc не использовать mmap и не отдавать память ОС: тогда массив,
-# освобождённый на прошлом вызове, переиспользуется уже прогретым.
-# ---------------------------------------------------------------------------
 def _tune_malloc():
     try:
         libc = ctypes.CDLL("libc.so.6")
-    except OSError:  # не glibc (Windows/macOS) — просто без оптимизации
+    except OSError:
         return
     M_TRIM_THRESHOLD, M_MMAP_MAX, M_ARENA_MAX = -1, -4, -8
     libc.mallopt(M_MMAP_MAX, 0)
@@ -138,18 +123,6 @@ def _tune_malloc():
 _tune_malloc()
 
 
-# ---------------------------------------------------------------------------
-# Конвейер через pinned-память.
-# Копировать с/на GPU быстрее всего из pinned (page-locked) памяти, но input и
-# результат — обычные numpy-массивы. Поэтому держим SLOTS небольших pinned-слотов
-# и гоняем данные кусками по CHUNK байт:
-#
-#   основной поток:  x --copyto--> pin_in[s] --H2D--> GPU --ядро--> GPU --D2H--> pin_out[s]
-#   второй поток:    pin_out[s] --copyto--> out
-#
-# Все стадии работают одновременно над разными кусками. np.copyto и ожидание
-# CUDA-событий отпускают GIL, поэтому потоки Python действительно параллельны.
-# ---------------------------------------------------------------------------
 _SLOTS = 4
 _CHUNK = 16 << 20  # 16 МБ
 
@@ -159,7 +132,6 @@ _pin_out = [cuda.pagelocked_empty(_CHUNK // 4, np.float32) for _ in range(_SLOTS
 _streams = [cuda.Stream() for _ in range(_SLOTS)]
 _ev_done = [cuda.Event(cuda.event_flags.DISABLE_TIMING) for _ in range(_SLOTS)]
 
-# Буферы на GPU живут между вызовами (не выделяем 512 МБ каждый раз).
 _state = {"bytes": 0, "d_in": None, "d_out": None, "cols": 0, "d_g": None, "d_b": None}
 
 
@@ -190,8 +162,6 @@ def layernorm_pycuda(input, gamma, beta, row_size, eps=1e-5):
     kern, threads = _pick_kernel(cols)
     eps32, cols32 = np.float32(eps), np.int32(cols)
     out = np.empty_like(x)
-
-    # Строка не влезает в слот — без конвейера, обычными копиями.
     if cols * 4 > _CHUNK:
         cuda.memcpy_htod(d_in, x)
         kern.prepared_call((rows, 1), (threads, 1, 1), int(d_in), int(d_out),
@@ -199,19 +169,19 @@ def layernorm_pycuda(input, gamma, beta, row_size, eps=1e-5):
         cuda.memcpy_dtoh(out, d_out)
         return out
 
-    r = min(rows, _CHUNK // (cols * 4))  # целых строк в одном куске
+    r = min(rows, _CHUNK // (cols * 4))
     chunks = (rows + r - 1) // r
-    issued = threading.Semaphore(0)       # кусок поставлен на GPU
-    free = threading.Semaphore(_SLOTS)    # слот освободился
+    issued = threading.Semaphore(0)      
+    free = threading.Semaphore(_SLOTS)  
 
-    def back():  # второй поток: забирает готовые куски из pin_out в out
-        _ctx.push()  # CUDA-контекст привязан к потоку
+    def back(): 
+        _ctx.push() 
         try:
             for i in range(chunks):
                 issued.acquire()
                 s, off = i % _SLOTS, i * r * cols
                 sz = min(r, rows - i * r) * cols
-                _ev_done[s].synchronize()  # ждём, пока D2H куска i закончится
+                _ev_done[s].synchronize()
                 np.copyto(out[off:off + sz], _pin_out[s][:sz])
                 free.release()
         finally:
@@ -222,8 +192,7 @@ def layernorm_pycuda(input, gamma, beta, row_size, eps=1e-5):
     for i in range(chunks):
         s, off = i % _SLOTS, i * r * cols
         sz = min(r, rows - i * r) * cols
-        # Слот s свободен, когда второй поток забрал кусок i - SLOTS
-        # (а значит, его H2D и D2H тоже закончились — они в том же стриме).
+
         free.acquire()
         np.copyto(_pin_in[s][:sz], x[off:off + sz])
         st = _streams[s]
