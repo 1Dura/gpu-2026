@@ -8,16 +8,9 @@
 #include <malloc.h>
 #endif
 
-// GELU(x) = 0.5x(1 + tanh(a)) = x / (1 + exp(-2a)),  a = sqrt(2/pi)(x + 0.044715x^3)
-//
-// Надёжная версия:
-//  - точный exp, без -cl-fast-relaxed-math;
-//  - показатель ограничен сверху (88), поэтому exp никогда не даёт inf,
-//    и деление не может выдать NaN ни при каких входных данных;
-//  - каждый поток считает 4 числа (float4), хвост (n % 4) — поштучно.
 static const char *kSource = R"CLC(
 __kernel void gelu(__global const float *in, __global float *out, ulong n) {
-    const float k = -1.5957691216057308f; // -2 * sqrt(2 / pi)
+    const float k = -1.5957691216057308f;
     ulong i = get_global_id(0) * 4;
     if (i + 3 < n) {
         float4 x = vload4(0, in + i);
@@ -39,9 +32,6 @@ static void Check(cl_int err, const char *what) {
                              " failed, OpenCL error " + std::to_string(err));
 }
 
-// Всё, что не зависит от входных данных, создаём один раз.
-// Одна in-order очередь: запись -> ядро -> чтение выполняются строго по
-// порядку, никакой синхронизации между очередями не нужно.
 struct OclState {
   int platform = -1;
   cl_context ctx = nullptr;
@@ -50,9 +40,6 @@ struct OclState {
   cl_kernel kernel = nullptr;
   cl_mem d_in = nullptr, d_out = nullptr;
   size_t allocated = 0;
-
-  ~OclState() = default; // ресурсы не освобождаем при выходе из программы:
-                         // драйвер может быть уже выгружен к этому моменту
 
   void Release() {
     if (d_in) clReleaseMemObject(d_in);
@@ -71,7 +58,7 @@ struct OclState {
   }
 
   void Init(int p) {
-    Release(); // при смене платформы старые буферы к новому контексту не подходят
+    Release();
     cl_uint np = 0;
     Check(clGetPlatformIDs(0, nullptr, &np), "clGetPlatformIDs");
     if (p < 0 || (cl_uint)p >= np)
@@ -119,10 +106,6 @@ struct OclState {
 
 static void TuneMalloc() {
 #ifdef __GLIBC__
-  // Без mmap и без возврата памяти ОС освобождённый вектор остаётся в куче,
-  // и следующий вектор на 512 МБ занимает уже прогретые страницы (без
-  // page fault'ов при обнулении). M_ARENA_MAX = 1 — чтобы это работало и для
-  // вектора, созданного в другом потоке (std::async).
   mallopt(M_MMAP_MAX, 0);
   mallopt(M_TRIM_THRESHOLD, -1);
   mallopt(M_ARENA_MAX, 1);
@@ -144,7 +127,6 @@ std::vector<float> GeluOCL(const std::vector<float> &input, int platform) {
     return {};
   size_t bytes = n * sizeof(float);
 
-  // Выходной вектор выделяется в другом потоке, пока GPU копирует и считает.
   auto fut = std::async(std::launch::async, [n] { return std::vector<float>(n); });
 
   st.Reserve(bytes);
@@ -160,11 +142,9 @@ std::vector<float> GeluOCL(const std::vector<float> &input, int platform) {
   Check(clEnqueueNDRangeKernel(st.q, st.kernel, 1, nullptr, &global, &local, 0, nullptr,
                                nullptr),
         "clEnqueueNDRangeKernel");
-  Check(clFlush(st.q), "clFlush"); // отправить работу на GPU, не дожидаясь вектора
+  Check(clFlush(st.q), "clFlush");
 
   std::vector<float> res = fut.get();
-  // Блокирующее чтение: функция возвращает результат только после того,
-  // как он целиком скопирован с GPU.
   Check(clEnqueueReadBuffer(st.q, st.d_out, CL_TRUE, 0, bytes, res.data(), 0, nullptr,
                             nullptr),
         "clEnqueueReadBuffer");
